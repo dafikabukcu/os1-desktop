@@ -1,6 +1,8 @@
 import { lazy, Suspense, type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { AudioLines, Mic, MicOff, Pause, Settings, Terminal } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { buildVoiceInstructions } from "./voicePrompts";
+import type { AssistantIdentity, PersonalityMode } from "./voiceTypes";
 
 const BootSequence = lazy(() =>
   import("./BootSequence").then((module) => ({ default: module.BootSequence })),
@@ -127,14 +129,7 @@ type ProfileCommandResult = {
   exitCode: number;
 };
 
-type AssistantIdentity = {
-  assistantName: string;
-  profileSlug: string;
-  distro: string;
-  profileReady?: boolean;
-};
-
-type SetupStep = "name" | "confirm" | "creating";
+type SetupStep = "discovering" | "name" | "confirm" | "creating";
 type SetupAction = "install" | "repair" | null;
 type ActivePanel = "workspace" | "terminal" | null;
 type ProviderChoice = "codex-subscription" | "openai-key";
@@ -152,6 +147,7 @@ const LOCAL_SPEECH_STOP = 0.075;
 const LOCAL_SPEECH_FRAMES_REQUIRED = 4;
 const REMOTE_SPEECH_START = 0.075;
 const IDENTITY_STORAGE_KEY = "os1.assistantIdentity.v1";
+const PERSONALITY_STORAGE_KEY = "os1.personalityMode.v1";
 
 declare global {
   interface Window {
@@ -167,7 +163,8 @@ export function App() {
   const [status, setStatus] = useState<HermesStatus | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<HermesRuntimeStatus | null>(null);
   const [identity, setIdentity] = useState<AssistantIdentity | null>(() => loadAssistantIdentity());
-  const [setupStep, setSetupStep] = useState<SetupStep>("name");
+  const [personalityMode, setPersonalityMode] = useState<PersonalityMode>(() => loadPersonalityMode());
+  const [setupStep, setSetupStep] = useState<SetupStep>(() => (window.__TAURI_INTERNALS__ && !loadAssistantIdentity() ? "discovering" : "name"));
   const [nameInput, setNameInput] = useState("");
   const [pendingName, setPendingName] = useState("");
   const [setupError, setSetupError] = useState("");
@@ -215,6 +212,79 @@ export function App() {
     setBootFinished(true);
     window.setTimeout(() => setSurfaceEntering(false), 1500);
   }, []);
+
+  useEffect(() => {
+    if (identity || setupStep !== "discovering") return;
+    if (!window.__TAURI_INTERNALS__) {
+      setSetupStep("name");
+      return;
+    }
+
+    let cancelled = false;
+
+    async function adoptExistingProfile() {
+      setPendingName("OS1");
+      setSetupError("");
+      setSetupAction(null);
+      setVoiceState("checking");
+      setMotionActivity("connecting");
+
+      try {
+        const catalog = await invoke<HermesProfileCatalog>("list_hermes_profiles");
+        if (cancelled) return;
+
+        setSetupDistro(catalog.distro);
+        const readyProfiles = catalog.profiles.filter((profile) => profile.exists && !profile.isDefault);
+        const selectedProfile = readyProfiles.length === 1 ? readyProfiles[0] : null;
+
+        if (!selectedProfile) {
+          setSetupStep("name");
+          return;
+        }
+
+        const assistantName = profileNameForDisplay(selectedProfile.name);
+        setPendingName(assistantName);
+        const runtime = await invoke<HermesRuntimeStatus>("check_hermes_runtime", {
+          distro: catalog.distro,
+          profile: selectedProfile.name,
+        });
+        if (cancelled) return;
+
+        setRuntimeStatus(runtime);
+        setProviderChoice(providerChoiceFromRuntime(runtime));
+        if (!runtime.ready) {
+          setSetupStep("name");
+          appendLog(`Existing Hermes profile ${selectedProfile.name} is not ready: ${runtime.message}`);
+          return;
+        }
+
+        const nextIdentity = {
+          assistantName,
+          profileSlug: selectedProfile.name,
+          distro: catalog.distro,
+          profileReady: true,
+        };
+        saveAssistantIdentity(nextIdentity);
+        setIdentity(nextIdentity);
+        appendLog(`Selected existing Hermes profile ${selectedProfile.name}`);
+      } catch (error) {
+        if (!cancelled) {
+          appendLog(`Existing Hermes profile discovery failed: ${String(error)}`);
+          setSetupStep("name");
+        }
+      } finally {
+        if (!cancelled) {
+          setVoiceState("idle");
+          setMotionActivity("idle");
+        }
+      }
+    }
+
+    void adoptExistingProfile();
+    return () => {
+      cancelled = true;
+    };
+  }, [identity, setupStep]);
 
   useEffect(() => {
     if (!identity || !window.__TAURI_INTERNALS__) return;
@@ -344,7 +414,7 @@ export function App() {
             type: "session.update",
             session: {
               type: "realtime",
-              instructions: buildVoiceInstructions(identity),
+              instructions: buildVoiceInstructions(identity, personalityMode),
               tools: buildRealtimeTools(identity),
               tool_choice: "auto",
             },
@@ -395,6 +465,26 @@ export function App() {
     setVoiceState("idle");
     setMotionActivity("idle");
     appendLog(`Voice surface ${reason}`);
+  }
+
+  function updatePersonalityMode(nextMode: PersonalityMode) {
+    setPersonalityMode(nextMode);
+    savePersonalityMode(nextMode);
+    appendLog(`Voice personality set to ${nextMode === "her" ? "Her" : "Assistant"}`);
+
+    if (dataChannelRef.current?.readyState === "open") {
+      dataChannelRef.current.send(
+        JSON.stringify({
+          type: "session.update",
+          session: {
+            type: "realtime",
+            instructions: buildVoiceInstructions(identity, nextMode),
+            tools: buildRealtimeTools(identity),
+            tool_choice: "auto",
+          },
+        }),
+      );
+    }
   }
 
   function handleRealtimeEvent(raw: string) {
@@ -1013,16 +1103,16 @@ export function App() {
                   <button type="submit">Submit</button>
                 </div>
               </form>
-            ) : setupStep === "creating" ? (
+            ) : setupStep === "creating" || setupStep === "discovering" ? (
               <div className="setup-loading" aria-live="polite" aria-busy="true">
-                <span className="setup-kicker">Creating presence</span>
+                <span className="setup-kicker">{setupStep === "discovering" ? "Finding presence" : "Creating presence"}</span>
                 <div className="setup-orbit" aria-hidden="true">
                   <span />
                   <span />
                   <span />
                 </div>
-                <h1>{pendingName}</h1>
-                <p>Preparing Hermes profile</p>
+                <h1>{pendingName || "OS1"}</h1>
+                <p>{setupStep === "discovering" ? "Looking for existing Hermes profiles" : "Preparing Hermes profile"}</p>
               </div>
             ) : (
               <div>
@@ -1165,6 +1255,34 @@ export function App() {
                   ) : null}
                   {providerOutput ? <pre className="panel-output provider-output">{providerOutput}</pre> : null}
                 </section>
+                <section className="provider-section" aria-label="Voice personality">
+                  <div>
+                    <span className="status-kicker">Personality</span>
+                    <p>{personalityMode === "her" ? "Her - intimate companion mode" : "Assistant - warm practical mode"}</p>
+                  </div>
+                  <div className="drawer-provider-options" role="radiogroup" aria-label="Voice personality mode">
+                    <button
+                      className={personalityMode === "assistant" ? "provider-option selected" : "provider-option"}
+                      type="button"
+                      role="radio"
+                      aria-checked={personalityMode === "assistant"}
+                      onClick={() => updatePersonalityMode("assistant")}
+                    >
+                      <span>Assistant</span>
+                      <small>Practical</small>
+                    </button>
+                    <button
+                      className={personalityMode === "her" ? "provider-option selected" : "provider-option"}
+                      type="button"
+                      role="radio"
+                      aria-checked={personalityMode === "her"}
+                      onClick={() => updatePersonalityMode("her")}
+                    >
+                      <span>Her</span>
+                      <small>Companion</small>
+                    </button>
+                  </div>
+                </section>
                 <button className="panel-action" type="button" onClick={runDoctor} disabled={doctorBusy}>
                   {doctorBusy ? "Running" : "Doctor"}
                 </button>
@@ -1210,6 +1328,15 @@ function saveAssistantIdentity(identity: AssistantIdentity) {
   window.localStorage.setItem(IDENTITY_STORAGE_KEY, JSON.stringify(identity));
 }
 
+function loadPersonalityMode(): PersonalityMode {
+  const value = window.localStorage.getItem(PERSONALITY_STORAGE_KEY);
+  return value === "her" ? "her" : "assistant";
+}
+
+function savePersonalityMode(mode: PersonalityMode) {
+  window.localStorage.setItem(PERSONALITY_STORAGE_KEY, mode);
+}
+
 function slugifyProfileName(name: string) {
   return name
     .trim()
@@ -1221,14 +1348,13 @@ function slugifyProfileName(name: string) {
     .slice(0, 48);
 }
 
-function buildVoiceInstructions(identity: AssistantIdentity | null) {
-  const nameLine = identity
-    ? `Your spoken name is ${identity.assistantName}. Treat that as your identity in conversation.`
-    : "You are OS1 voice mode.";
-  const hermesLine = identity
-    ? `You can call OS1 tools to check or ask the selected Hermes profile named ${identity.profileSlug}. Hermes Agent is your capability bridge for things you cannot do directly, including browser use, files, shell commands, skills, and agent memory. If the user asks for something you are unsure you can do, first ask Hermes to inspect its available skills or use the relevant Hermes capability instead of saying you cannot. Use ask_hermes for workspace, browser, skill, or agent-memory tasks when the user's request needs Hermes context.`
-    : "";
-  return `${nameLine} Keep spoken replies brief, warm, and useful. Ask one focused question when you need direction. Do not repeatedly introduce yourself, and do not start task results with phrases like "Iris here"; answer naturally and directly. ${hermesLine}`;
+function profileNameForDisplay(profileName: string) {
+  const words = profileName
+    .split(/[-_\s]+/)
+    .map((word) => word.trim())
+    .filter(Boolean);
+  if (!words.length) return "OS1";
+  return words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
 }
 
 function buildRealtimeTools(identity: AssistantIdentity | null) {

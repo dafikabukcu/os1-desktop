@@ -2,7 +2,7 @@ export class InfinityLoader {
   constructor(
     canvas: HTMLCanvasElement,
     options?: {
-      transitionStepRate?: number;
+      transitionDurationMs?: number;
       maxCanvasSize?: number;
     },
   );

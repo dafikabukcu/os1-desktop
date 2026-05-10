@@ -11,6 +11,10 @@ function easeInOutQuad(t, b, c, d) {
   return (-c / 2) * (--t * (t - 2) - 1) + b;
 }
 
+function easeInCubic(t) {
+  return t * t * t;
+}
+
 class CustomSinCurve extends THREE.Curve {
   constructor(scale = 1) {
     super();
@@ -44,10 +48,11 @@ export class InfinityLoader {
     this.acceleration = 0;
     this.animateStep = 0;
     this.toEnd = false;
+    this.transitionStartedAt = null;
     this.isComplete = false;
     this.onComplete = null;
     this.wobbleTime = 0;
-    this.transitionStepRate = options.transitionStepRate ?? 1;
+    this.transitionDurationMs = options.transitionDurationMs ?? 13_000;
     this.maxCanvasSize = options.maxCanvasSize ?? 500;
     this.init();
   }
@@ -130,49 +135,58 @@ export class InfinityLoader {
 
   triggerTransition() {
     this.toEnd = true;
+    this.transitionStartedAt = performance.now();
   }
 
   animate = () => {
     if (this.isComplete || !this.isAnimating) return;
 
-    this.animateStep = Math.max(
-      0,
-      Math.min(720, this.toEnd ? this.animateStep + this.transitionStepRate : this.animateStep - 4),
-    );
-    this.acceleration = easeInOutQuad(this.animateStep, 0, 1, 720);
-    this.mesh.rotation.x += this.rotateValue + this.acceleration;
+    if (this.toEnd && this.transitionStartedAt !== null) {
+      const elapsed = performance.now() - this.transitionStartedAt;
+      const progress = Math.min(elapsed / this.transitionDurationMs, 1);
+      this.animateStep = progress * 720;
+      this.acceleration = easeInCubic(progress);
+    } else {
+      this.animateStep = 0;
+      this.acceleration = 0;
+    }
 
-    if (this.acceleration > 0.35) {
-      const progress = (this.acceleration - 0.35) / 0.65;
-      this.group.rotation.y = (-Math.PI / 2) * progress;
-      this.group.position.z = 50 * progress;
+    this.mesh.rotation.x += this.rotateValue + this.acceleration * 1.15;
 
-      const morphProgress = Math.max(0, (this.acceleration - 0.45) / 0.54);
+    if (this.toEnd && this.transitionStartedAt !== null) {
+      const transitionProgress = Math.min((performance.now() - this.transitionStartedAt) / this.transitionDurationMs, 1);
+      const turnProgress = Math.max(0, (transitionProgress - 0.72) / 0.28);
+      const easedTurn = easeInCubic(turnProgress);
+      this.group.rotation.y = (-Math.PI / 2) * easedTurn;
+      this.group.position.z = 50 * easedTurn;
+
+      const morphProgress = Math.max(0, (transitionProgress - 0.78) / 0.22);
+      const easedMorph = easeInCubic(morphProgress);
 
       if (morphProgress > 0) {
-        const compression = 1 - morphProgress * 0.95;
+        const compression = 1 - easedMorph * 0.95;
         this.mesh.scale.x = compression;
-        this.mesh.scale.y = 1 - morphProgress * 0.85;
-        this.mesh.scale.z = 1 - morphProgress * 0.85;
-        this.mesh.position.x = morphProgress * 31.1 * 0.5;
+        this.mesh.scale.y = 1 - easedMorph * 0.85;
+        this.mesh.scale.z = 1 - easedMorph * 0.85;
+        this.mesh.position.x = easedMorph * 31.1 * 0.5;
       }
 
-      const helixFade = Math.min(1, morphProgress / 0.4);
+      const helixFade = Math.min(1, easedMorph / 0.42);
       this.mesh.material.opacity = 1 - helixFade;
 
-      const ringEmergence = Math.max(0, (morphProgress - 0.35) / 0.3);
+      const ringEmergence = Math.max(0, (easedMorph - 0.35) / 0.3);
       this.ring.material.opacity = Math.min(1, ringEmergence);
 
       if (morphProgress > 0) {
         this.wobbleTime += 0.18;
-        const settleEase = Math.min(1, Math.max(0, (1 - morphProgress) / 0.2));
+        const settleEase = Math.min(1, Math.max(0, (1 - easedMorph) / 0.2));
         const helixMomentum = this.mesh.rotation.x * 0.4 * settleEase;
 
         this.ring.rotation.x = Math.sin(this.wobbleTime * 1.3 + helixMomentum) * 2.5 * settleEase;
         this.ring.rotation.y = Math.PI / 2 + Math.sin(this.wobbleTime * 0.7) * 1.8 * settleEase;
         this.ring.rotation.z = Math.cos(this.wobbleTime * 0.9 + helixMomentum * 0.5) * 2.0 * settleEase;
 
-        const baseScale = 0.1 + 0.9 * morphProgress;
+        const baseScale = 0.1 + 0.9 * easedMorph;
         this.ring.scale.set(
           baseScale * (1 + Math.sin(this.wobbleTime * 1.7) * 0.5 * settleEase),
           baseScale * (1 + Math.cos(this.wobbleTime * 1.1) * 0.4 * settleEase),
@@ -185,7 +199,7 @@ export class InfinityLoader {
         this.mesh.position.x = 0;
       }
 
-      if (this.acceleration >= 0.99 && !this.isComplete) {
+      if (transitionProgress >= 1 && !this.isComplete) {
         this.mesh.material.opacity = 0;
         this.mesh.position.x = 0;
         this.ring.material.opacity = 1;

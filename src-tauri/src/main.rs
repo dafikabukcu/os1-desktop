@@ -177,6 +177,72 @@ struct CommandCapture {
     code: Option<i32>,
 }
 
+fn read_env_value_from_file(path: &Path, name: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn dotenv_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(directory) = std::env::current_dir() {
+        for ancestor in directory.ancestors().take(6) {
+            candidates.push(ancestor.join(".env"));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            for ancestor in directory.ancestors().take(8) {
+                candidates.push(ancestor.join(".env"));
+            }
+        }
+    }
+
+    candidates
+}
+
+fn os1_env_value(name: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(name) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+
+    for candidate in dotenv_candidates() {
+        if candidate.is_file() {
+            if let Some(value) = read_env_value_from_file(&candidate, name) {
+                return Some(value);
+            }
+        }
+    }
+
+    None
+}
+
+fn openai_api_key() -> Result<String, String> {
+    os1_env_value("OPENAI_API_KEY").ok_or_else(|| {
+        "OPENAI_API_KEY is not configured for OS1. Put it in .env next to the app project or configure a key in Settings.".to_string()
+    })
+}
+
 struct HermesRuntime {
     hermes_home: String,
     hermes_command: String,
@@ -819,12 +885,7 @@ fn configure_openai_key_provider(
     profile: &str,
     runtime: &HermesRuntime,
 ) -> Result<ConfigureHermesProviderResult, String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is not configured for OS1.".to_string())?;
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("OPENAI_API_KEY is empty.".to_string());
-    }
+    let api_key = openai_api_key()?;
 
     write_provider_config(
         distro,
@@ -1907,8 +1968,8 @@ fn summarize_command_error(error: &CommandCapture) -> String {
 
 #[tauri::command]
 fn realtime_key_status() -> RealtimeKeyStatus {
-    match std::env::var("OPENAI_API_KEY") {
-        Ok(value) if !value.trim().is_empty() => RealtimeKeyStatus {
+    match os1_env_value("OPENAI_API_KEY") {
+        Some(_) => RealtimeKeyStatus {
             configured: true,
             source: "OPENAI_API_KEY".to_string(),
         },
@@ -1921,12 +1982,7 @@ fn realtime_key_status() -> RealtimeKeyStatus {
 
 #[tauri::command]
 async fn create_realtime_call(sdp: String) -> Result<String, String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is not configured for the Tauri process.".to_string())?;
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("OPENAI_API_KEY is empty.".to_string());
-    }
+    let api_key = openai_api_key()?;
 
     let session = serde_json::json!({
         "type": "realtime",

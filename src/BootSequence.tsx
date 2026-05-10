@@ -9,16 +9,43 @@ const LOAD_LEAD_IN_MS = 700;
 const TAGLINE_DELAY_MS = 450;
 const HELIX_START_MS = 100;
 const TRIGGER_TRANSITION_MS = 1250;
-const MORPH_TO_DOT_MS = 420;
+const MORPH_TO_DOT_MS = 780;
+const HELIX_TO_RING_MS = 13_050;
+const AUDIO_FALLBACK_MS = 14_250;
 const TAGLINE = "We believe in infinity";
 
 function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function playInitSound() {
+  const audio = new Audio("/startup.mp3");
+  audio.preload = "auto";
+
+  let settled = false;
+  let fallbackId = 0;
+
+  const ended = new Promise<void>((resolve) => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(fallbackId);
+      resolve();
+    };
+
+    audio.addEventListener("ended", finish, { once: true });
+    audio.addEventListener("error", finish, { once: true });
+    fallbackId = window.setTimeout(finish, AUDIO_FALLBACK_MS);
+  });
+
+  void audio.play().catch(() => undefined);
+  return { audio, ended };
+}
+
 export function BootSequence({ onFinished }: BootSequenceProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const loaderRef = useRef<InfinityLoader | null>(null);
+  const bootAudioRef = useRef<HTMLAudioElement | null>(null);
   const finishedRef = useRef(false);
   const [brandVisible, setBrandVisible] = useState(false);
   const [taglineVisible, setTaglineVisible] = useState(false);
@@ -30,7 +57,7 @@ export function BootSequence({ onFinished }: BootSequenceProps) {
     if (!canvas) return undefined;
 
     const loader = new InfinityLoader(canvas, {
-      transitionStepRate: 5,
+      transitionDurationMs: HELIX_TO_RING_MS,
       maxCanvasSize: 560,
     });
     loaderRef.current = loader;
@@ -50,18 +77,23 @@ export function BootSequence({ onFinished }: BootSequenceProps) {
       await delay(TRIGGER_TRANSITION_MS);
       if (cancelled) return;
 
+      const { audio, ended: audioEnded } = playInitSound();
+      bootAudioRef.current = audio;
       loader.triggerTransition();
       await helixComplete;
       if (cancelled) return;
 
       setFadingChrome(true);
       await loader.morphToDot(MORPH_TO_DOT_MS);
+      await audioEnded;
       finish();
     }
 
     function finish() {
       if (finishedRef.current) return;
       finishedRef.current = true;
+      bootAudioRef.current?.pause();
+      bootAudioRef.current = null;
       onFinished();
     }
 
@@ -69,6 +101,8 @@ export function BootSequence({ onFinished }: BootSequenceProps) {
 
     return () => {
       cancelled = true;
+      bootAudioRef.current?.pause();
+      bootAudioRef.current = null;
       loader.destroy();
     };
   }, [onFinished]);
@@ -76,6 +110,8 @@ export function BootSequence({ onFinished }: BootSequenceProps) {
   function skipBoot() {
     if (finishedRef.current) return;
     finishedRef.current = true;
+    bootAudioRef.current?.pause();
+    bootAudioRef.current = null;
     loaderRef.current?.destroy();
     onFinished();
   }
