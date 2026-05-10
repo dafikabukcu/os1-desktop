@@ -806,6 +806,10 @@ button {
   line-height: 1.35;
 }
 
+.memory-path-row {
+  grid-template-columns: 54px minmax(0, 1fr);
+}
+
 .provider-section {
   display: grid;
   gap: 14px;
@@ -925,6 +929,36 @@ button {
 .provider-output {
   min-height: 70px;
   max-height: 150px;
+}
+
+.session-debug-section {
+  gap: 12px;
+}
+
+.session-turn-list {
+  display: grid;
+  gap: 8px;
+}
+
+.session-turn {
+  display: grid;
+  gap: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.18);
+  padding-left: 10px;
+}
+
+.session-turn span {
+  color: rgba(255, 238, 228, 0.66);
+  font-size: 10px;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+}
+
+.session-turn p {
+  margin: 0;
+  color: rgba(255, 244, 238, 0.86);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .terminal-entry {

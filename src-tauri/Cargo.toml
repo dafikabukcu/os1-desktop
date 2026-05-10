@@ -9,7 +9,8 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }

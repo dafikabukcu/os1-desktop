@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
 #[derive(serde::Serialize)]
 struct HermesStatus {
@@ -171,6 +172,61 @@ struct ProfileCommandResult {
     exit_code: i32,
 }
 
+#[derive(serde::Serialize)]
+struct MemoryVaultStatus {
+    profile: String,
+    path: String,
+    ready: bool,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryAppendResult {
+    profile: String,
+    path: String,
+    written: bool,
+    summary: String,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryContextResult {
+    profile: String,
+    path: String,
+    context: String,
+    #[serde(rename = "sourceCount")]
+    source_count: usize,
+    #[serde(rename = "truncated")]
+    truncated: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+enum MemorySessionTurn {
+    User {
+        text: String,
+        at: String,
+        #[serde(rename = "itemId")]
+        item_id: Option<String>,
+    },
+    Assistant {
+        text: String,
+        at: String,
+        #[serde(rename = "itemId")]
+        item_id: Option<String>,
+        #[serde(rename = "responseId")]
+        response_id: Option<String>,
+    },
+    Tool {
+        name: String,
+        input: serde_json::Value,
+        output: serde_json::Value,
+        at: String,
+        #[serde(rename = "callId")]
+        call_id: Option<String>,
+    },
+}
+
 struct CommandCapture {
     stdout: String,
     stderr: String,
@@ -241,6 +297,42 @@ fn openai_api_key() -> Result<String, String> {
     os1_env_value("OPENAI_API_KEY").ok_or_else(|| {
         "OPENAI_API_KEY is not configured for OS1. Put it in .env next to the app project or configure a key in Settings.".to_string()
     })
+}
+
+fn memory_root() -> Result<PathBuf, String> {
+    let app_data = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "APPDATA is not available for OS1 memory storage.".to_string())?;
+    Ok(app_data.join("OS1").join("memory"))
+}
+
+fn memory_vault_path(profile: &str) -> Result<PathBuf, String> {
+    let slug = sanitize_profile_slug(profile)?;
+    Ok(memory_root()?.join(slug))
+}
+
+fn sanitize_profile_slug(profile: &str) -> Result<String, String> {
+    let slug: String = profile
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(64)
+        .collect();
+
+    if slug.is_empty() {
+        Err("Memory profile name is empty.".to_string())
+    } else {
+        Ok(slug)
+    }
 }
 
 struct HermesRuntime {
@@ -379,6 +471,26 @@ async fn run_profile_command(
     command: String,
 ) -> Result<ProfileCommandResult, String> {
     run_background(move || run_profile_command_blocking(distro, profile, command)).await
+}
+
+#[tauri::command]
+async fn ensure_memory_vault(profile: String) -> Result<MemoryVaultStatus, String> {
+    run_background(move || ensure_memory_vault_blocking(profile)).await
+}
+
+#[tauri::command]
+async fn summarize_and_append_memory(
+    profile: String,
+    assistant_name: String,
+    personality_mode: String,
+    turns: Vec<MemorySessionTurn>,
+) -> Result<MemoryAppendResult, String> {
+    summarize_and_append_memory_async(profile, assistant_name, personality_mode, turns).await
+}
+
+#[tauri::command]
+async fn read_memory_context(profile: String) -> Result<MemoryContextResult, String> {
+    run_background(move || read_memory_context_blocking(profile)).await
 }
 
 fn detect_hermes_blocking() -> HermesStatus {
@@ -1150,6 +1262,311 @@ fn run_profile_command_blocking(
         output: compact_text(&output, 12000),
         exit_code,
     })
+}
+
+fn ensure_memory_vault_blocking(profile: String) -> Result<MemoryVaultStatus, String> {
+    let slug = sanitize_profile_slug(&profile)?;
+    let vault = memory_vault_path(&slug)?;
+
+    fs::create_dir_all(vault.join("days"))
+        .map_err(|error| format!("Could not create memory days folder: {error}"))?;
+    fs::create_dir_all(vault.join("facts"))
+        .map_err(|error| format!("Could not create memory facts folder: {error}"))?;
+    fs::create_dir_all(vault.join("relationship"))
+        .map_err(|error| format!("Could not create memory relationship folder: {error}"))?;
+
+    ensure_file(
+        &vault.join("facts").join("about-user.md"),
+        "# About User\n\nNo stable facts saved yet.\n",
+    )?;
+    ensure_file(
+        &vault.join("facts").join("preferences.md"),
+        "# Preferences\n\nNo stable preferences saved yet.\n",
+    )?;
+    ensure_file(
+        &vault.join("relationship").join("continuity.md"),
+        "# Relationship Continuity\n\nNo relationship continuity saved yet.\n",
+    )?;
+    ensure_file(
+        &vault.join("open-loops.md"),
+        "# Open Loops\n\nNo open loops saved yet.\n",
+    )?;
+
+    Ok(MemoryVaultStatus {
+        profile: slug,
+        path: vault.display().to_string(),
+        ready: true,
+        message: "OS1 memory vault is ready.".to_string(),
+    })
+}
+
+fn ensure_file(path: &Path, content: &str) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, content).map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn read_memory_context_blocking(profile: String) -> Result<MemoryContextResult, String> {
+    let vault = ensure_memory_vault_blocking(profile)?;
+    let vault_path = PathBuf::from(&vault.path);
+    let max_chars = 8_000;
+    let mut sections = Vec::new();
+    let mut source_count = 0;
+
+    for (label, relative_path) in [
+        ("About User", "facts/about-user.md"),
+        ("Preferences", "facts/preferences.md"),
+        ("Relationship Continuity", "relationship/continuity.md"),
+        ("Open Loops", "open-loops.md"),
+    ] {
+        let path = vault_path.join(relative_path);
+        if let Some(content) = read_memory_file_if_useful(&path) {
+            sections.push(format!("## {label}\n\n{}", content.trim()));
+            source_count += 1;
+        }
+    }
+
+    for path in latest_daily_memory_paths(&vault_path.join("days"), 3)? {
+        if let Some(content) = read_memory_file_if_useful(&path) {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("daily-memory");
+            sections.push(format!("## Recent Memory: {file_name}\n\n{}", content.trim()));
+            source_count += 1;
+        }
+    }
+
+    let combined = sections.join("\n\n");
+    let (context, truncated) = cap_memory_context(&combined, max_chars);
+
+    Ok(MemoryContextResult {
+        profile: vault.profile,
+        path: vault.path,
+        context,
+        source_count,
+        truncated,
+    })
+}
+
+fn read_memory_file_if_useful(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.contains("No stable") || trimmed.contains("No open loops") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn latest_daily_memory_paths(days_path: &Path, limit: usize) -> Result<Vec<PathBuf>, String> {
+    if !days_path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(days_path)
+        .map_err(|error| format!("Could not read memory days folder: {error}"))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    paths.truncate(limit);
+    Ok(paths)
+}
+
+fn cap_memory_context(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    let capped = text.chars().take(max_chars).collect::<String>();
+    (format!("{}\n\n[Memory context truncated. Use memory search for deeper recall.]", capped.trim()), true)
+}
+
+async fn summarize_and_append_memory_async(
+    profile: String,
+    assistant_name: String,
+    personality_mode: String,
+    turns: Vec<MemorySessionTurn>,
+) -> Result<MemoryAppendResult, String> {
+    let vault = ensure_memory_vault_blocking(profile.clone())?;
+    let useful_turns = memory_turns_to_text(&turns);
+    if useful_turns.trim().is_empty() {
+        return Ok(MemoryAppendResult {
+            profile: vault.profile,
+            path: vault.path,
+            written: false,
+            summary: String::new(),
+            message: "No voice transcript was captured for memory.".to_string(),
+        });
+    }
+
+    let summary = summarize_memory_turns(&assistant_name, &personality_mode, &useful_turns).await?;
+    if summary.trim().is_empty() || summary.trim().eq_ignore_ascii_case("no memory") {
+        return Ok(MemoryAppendResult {
+            profile: vault.profile,
+            path: vault.path,
+            written: false,
+            summary,
+            message: "No durable memory was found in this session.".to_string(),
+        });
+    }
+
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let date = now
+        .format(format_description!("[year]-[month]-[day]"))
+        .map_err(|error| format!("Could not format memory date: {error}"))?;
+    let timestamp = now
+        .format(&Rfc3339)
+        .map_err(|error| format!("Could not format memory timestamp: {error}"))?;
+    let daily_path = memory_vault_path(&vault.profile)?.join("days").join(format!("{date}.md"));
+    let first_write = !daily_path.exists();
+
+    if let Some(parent) = daily_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create memory day folder: {error}"))?;
+    }
+
+    let mut entry = String::new();
+    if first_write {
+        entry.push_str(&format!(
+            "---\ncreated: {timestamp}\nsource: os1-voice\nassistant: {assistant_name}\nmode: {personality_mode}\ntags: [os1-memory, voice-session]\n---\n\n# {date}\n"
+        ));
+    }
+    entry.push_str(&format!("\n## Session {timestamp}\n\n{}\n", summary.trim()));
+
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&daily_path)
+        .and_then(|mut file| file.write_all(entry.as_bytes()))
+        .map_err(|error| format!("Could not append memory note: {error}"))?;
+
+    Ok(MemoryAppendResult {
+        profile: vault.profile,
+        path: daily_path.display().to_string(),
+        written: true,
+        summary,
+        message: "Voice memory summary saved.".to_string(),
+    })
+}
+
+fn memory_turns_to_text(turns: &[MemorySessionTurn]) -> String {
+    let mut lines = Vec::new();
+    for turn in turns.iter().take(120) {
+        match turn {
+            MemorySessionTurn::User { text, .. } if !text.trim().is_empty() => {
+                lines.push(format!("User: {}", text.trim()));
+            }
+            MemorySessionTurn::Assistant { text, .. } if !text.trim().is_empty() => {
+                lines.push(format!("Assistant: {}", text.trim()));
+            }
+            MemorySessionTurn::Tool {
+                name,
+                input,
+                output,
+                ..
+            } => {
+                lines.push(format!(
+                    "Tool {name}: input={} output={}",
+                    compact_json(input),
+                    compact_json(output)
+                ));
+            }
+            _ => {}
+        }
+    }
+    lines.join("\n")
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.len() > 900 {
+        format!("{}...", &text[..900])
+    } else {
+        text
+    }
+}
+
+async fn summarize_memory_turns(
+    assistant_name: &str,
+    personality_mode: &str,
+    transcript: &str,
+) -> Result<String, String> {
+    let api_key = openai_api_key()?;
+    let model = os1_env_value("OS1_MEMORY_MODEL").unwrap_or_else(|| "gpt-5.5".to_string());
+    let prompt = format!(
+        "You are OS1's private memory extractor for {assistant_name}.\n\
+The transcript labels are authoritative: lines beginning with User are about the human user, and lines beginning with Assistant are about {assistant_name}. \
+Never attribute a User fact to {assistant_name}. If the user says \"I\", \"me\", or \"my\" on a User line, write it as \"The user\". \
+If the assistant says \"I\" on an Assistant line, write it as \"{assistant_name}\" only when the assistant's own preference or continuity matters.\n\
+Summarize only durable memory from this voice session. Do not include raw transcript. \
+Save personal facts, preferences, relationship continuity, important emotional context, and open loops. \
+Skip small talk and anything not useful later. If nothing durable should be saved, return exactly: No memory\n\n\
+Assistant mode: {personality_mode}\n\n\
+Return Markdown using only these sections when relevant:\n\
+### Session Summary\n\
+### Remember\n\
+### Open Loops\n\n\
+Transcript:\n{transcript}"
+    );
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 700
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Memory summarization failed: {error}"))?;
+
+    let status = response.status();
+    let body_text = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read memory summarization response: {error}"))?;
+
+    if !status.is_success() {
+        return Err(format!("OpenAI memory summarization returned {status}: {body_text}"));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&body_text)
+        .map_err(|error| format!("Could not parse memory summarization response: {error}"))?;
+    extract_response_text(&value).ok_or_else(|| "Memory summarization returned no text.".to_string())
+}
+
+fn extract_response_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(|text| text.as_str()) {
+        return Some(text.trim().to_string());
+    }
+
+    let output = value.get("output")?.as_array()?;
+    let mut parts = Vec::new();
+    for item in output {
+        let Some(content) = item.get("content").and_then(|content| content.as_array()) else {
+            continue;
+        };
+        for content_item in content {
+            if let Some(text) = content_item.get("text").and_then(|text| text.as_str()) {
+                parts.push(text);
+            }
+        }
+    }
+    let text = parts.join("\n").trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn detect_native_hermes() -> NativeHermesStatus {
@@ -2030,13 +2447,16 @@ fn main() {
             create_hermes_profile,
             create_realtime_call,
             detect_hermes,
+            ensure_memory_vault,
             import_codex_auth_to_wsl,
             install_hermes,
             list_hermes_profiles,
+            read_memory_context,
             repair_hermes,
             run_hermes_doctor,
             run_profile_command,
-            realtime_key_status
+            realtime_key_status,
+            summarize_and_append_memory
         ])
         .run(tauri::generate_context!())
         .expect("error while running OS1 Windows client");

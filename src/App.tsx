@@ -129,6 +129,29 @@ type ProfileCommandResult = {
   exitCode: number;
 };
 
+type MemoryVaultStatus = {
+  profile: string;
+  path: string;
+  ready: boolean;
+  message: string;
+};
+
+type MemoryAppendResult = {
+  profile: string;
+  path: string;
+  written: boolean;
+  summary: string;
+  message: string;
+};
+
+type MemoryContextResult = {
+  profile: string;
+  path: string;
+  context: string;
+  sourceCount: number;
+  truncated: boolean;
+};
+
 type SetupStep = "discovering" | "name" | "confirm" | "creating";
 type SetupAction = "install" | "repair" | null;
 type ActivePanel = "workspace" | "terminal" | null;
@@ -141,11 +164,34 @@ type RealtimeFunctionCallItem = {
   arguments?: string;
 };
 
+type MemorySessionTurn =
+  | { role: "user"; text: string; at: string; itemId?: string }
+  | { role: "assistant"; text: string; at: string; itemId?: string; responseId?: string }
+  | { role: "tool"; name: string; input: unknown; output: unknown; at: string; callId?: string };
+
+type RealtimeEvent = {
+  type?: string;
+  error?: { message?: string };
+  item?: RealtimeFunctionCallItem & {
+    role?: string;
+    content?: Array<{
+      type?: string;
+      text?: string;
+      transcript?: string;
+    }>;
+  };
+  item_id?: string;
+  response_id?: string;
+  transcript?: string;
+  text?: string;
+};
+
 const LOCAL_NOISE_FLOOR = 0.032;
 const LOCAL_SPEECH_START = 0.17;
 const LOCAL_SPEECH_STOP = 0.075;
 const LOCAL_SPEECH_FRAMES_REQUIRED = 4;
 const REMOTE_SPEECH_START = 0.075;
+const MEMORY_SESSION_TURN_LIMIT = 160;
 const IDENTITY_STORAGE_KEY = "os1.assistantIdentity.v1";
 const PERSONALITY_STORAGE_KEY = "os1.personalityMode.v1";
 
@@ -180,6 +226,10 @@ export function App() {
   const [providerBusy, setProviderBusy] = useState(false);
   const [providerOutput, setProviderOutput] = useState("");
   const [codexImportReady, setCodexImportReady] = useState(false);
+  const [memorySessionPreview, setMemorySessionPreview] = useState<MemorySessionTurn[]>([]);
+  const [memoryStatus, setMemoryStatus] = useState<MemoryVaultStatus | null>(null);
+  const [memoryOutput, setMemoryOutput] = useState("");
+  const [memoryBusy, setMemoryBusy] = useState(false);
   const [, setLog] = useState<string[]>([
     "OS1 surface initialized",
     "Realtime voice bridge ready",
@@ -199,6 +249,10 @@ export function App() {
   const voiceStateRef = useRef<VoiceState>("idle");
   const levelsRef = useRef({ local: 0, remote: 0 });
   const localSpeechFramesRef = useRef(0);
+  const memorySessionTurnsRef = useRef<MemorySessionTurn[]>([]);
+  const memoryTurnKeysRef = useRef<Set<string>>(new Set());
+  const memoryTextKeysRef = useRef<Set<string>>(new Set());
+  const activeMemoryContextRef = useRef("");
 
   const isLive = voiceState === "listening";
   const isMuted = voiceState === "muted";
@@ -313,6 +367,11 @@ export function App() {
     };
   }, [identity?.distro, identity?.profileSlug]);
 
+  useEffect(() => {
+    if (!identity || !window.__TAURI_INTERNALS__) return;
+    void ensureMemoryVault();
+  }, [identity?.profileSlug]);
+
   async function checkHermes() {
     setVoiceState("checking");
     setMotionActivity("connecting");
@@ -352,6 +411,7 @@ export function App() {
 
   async function startVoice() {
     if (voiceState === "checking" || voiceState === "starting" || peerRef.current || shouldShowOnboarding) return;
+    resetMemorySession();
     setVoiceState("starting");
     setMotionActivity("connecting");
     appendLog("Starting Realtime voice");
@@ -373,6 +433,9 @@ export function App() {
             : "Realtime voice runs inside Tauri with OPENAI_API_KEY configured.",
         );
       }
+
+      const memoryContext = await readMemoryContextForVoice();
+      activeMemoryContextRef.current = memoryContext;
 
       const peer = new RTCPeerConnection();
       peerRef.current = peer;
@@ -414,9 +477,16 @@ export function App() {
             type: "session.update",
             session: {
               type: "realtime",
-              instructions: buildVoiceInstructions(identity, personalityMode),
+              instructions: buildVoiceInstructions(identity, personalityMode, activeMemoryContextRef.current),
               tools: buildRealtimeTools(identity),
               tool_choice: "auto",
+              audio: {
+                input: {
+                  transcription: {
+                    model: "gpt-4o-mini-transcribe",
+                  },
+                },
+              },
             },
           }),
         );
@@ -451,6 +521,8 @@ export function App() {
   }
 
   function stopVoice(reason = "stopped") {
+    const capturedTurns = memorySessionTurnsRef.current.length;
+    const turnsToSave = [...memorySessionTurnsRef.current];
     stopActivityMeter();
     dataChannelRef.current?.close();
     peerRef.current?.close();
@@ -465,6 +537,11 @@ export function App() {
     setVoiceState("idle");
     setMotionActivity("idle");
     appendLog(`Voice surface ${reason}`);
+    if (capturedTurns > 0) {
+      appendLog(`Captured ${capturedTurns} memory turns`);
+      void saveMemorySummary(turnsToSave);
+    }
+    setMemorySessionPreview([...memorySessionTurnsRef.current]);
   }
 
   function updatePersonalityMode(nextMode: PersonalityMode) {
@@ -478,9 +555,16 @@ export function App() {
           type: "session.update",
           session: {
             type: "realtime",
-            instructions: buildVoiceInstructions(identity, nextMode),
+            instructions: buildVoiceInstructions(identity, nextMode, activeMemoryContextRef.current),
             tools: buildRealtimeTools(identity),
             tool_choice: "auto",
+            audio: {
+              input: {
+                transcription: {
+                  model: "gpt-4o-mini-transcribe",
+                },
+              },
+            },
           },
         }),
       );
@@ -489,15 +573,36 @@ export function App() {
 
   function handleRealtimeEvent(raw: string) {
     try {
-      const event = JSON.parse(raw) as {
-        type?: string;
-        error?: { message?: string };
-        item?: RealtimeFunctionCallItem;
-      };
+      const event = JSON.parse(raw) as RealtimeEvent;
       if (event.type === "session.created") {
         appendLog("Realtime session created");
       } else if (event.type === "error") {
         appendLog(`Realtime error: ${event.error?.message ?? "unknown"}`);
+      } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+        recordMemoryTurn({
+          role: "user",
+          text: event.transcript ?? "",
+          at: new Date().toISOString(),
+          itemId: event.item_id,
+        });
+      } else if (event.type === "conversation.item.input_audio_transcription.failed") {
+        appendLog(`Transcript failed: ${event.error?.message ?? "unknown"}`);
+      } else if (event.type === "response.output_audio_transcript.done" || event.type === "response.audio_transcript.done") {
+        recordMemoryTurn({
+          role: "assistant",
+          text: event.transcript ?? "",
+          at: new Date().toISOString(),
+          itemId: event.item_id,
+          responseId: event.response_id,
+        });
+      } else if (event.type === "response.output_text.done") {
+        recordMemoryTurn({
+          role: "assistant",
+          text: event.text ?? "",
+          at: new Date().toISOString(),
+          itemId: event.item_id,
+          responseId: event.response_id,
+        });
       } else if (event.type === "input_audio_buffer.speech_started") {
         if (levelsRef.current.local > LOCAL_SPEECH_START) {
           setMotionActivity("user-speaking");
@@ -510,6 +615,14 @@ export function App() {
         setMotionActivity("listening");
       } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
         void handleRealtimeFunctionCall(event.item);
+      } else if (event.type === "response.output_item.done" && event.item?.type === "message" && event.item.role === "assistant") {
+        recordMemoryTurn({
+          role: "assistant",
+          text: transcriptFromContent(event.item.content),
+          at: new Date().toISOString(),
+          itemId: event.item_id,
+          responseId: event.response_id,
+        });
       }
     } catch {
       appendLog("Realtime event received");
@@ -540,6 +653,15 @@ export function App() {
         output = { error: `Unknown OS1 tool: ${item.name}` };
       }
 
+      recordMemoryTurn({
+        role: "tool",
+        name: item.name ?? "unknown",
+        input: args,
+        output,
+        at: new Date().toISOString(),
+        callId: item.call_id,
+      });
+
       channel.send(
         JSON.stringify({
           type: "conversation.item.create",
@@ -564,6 +686,44 @@ export function App() {
       );
       channel.send(JSON.stringify({ type: "response.create" }));
     }
+  }
+
+  function resetMemorySession() {
+    memorySessionTurnsRef.current = [];
+    memoryTurnKeysRef.current = new Set();
+    memoryTextKeysRef.current = new Set();
+  }
+
+  function recordMemoryTurn(turn: MemorySessionTurn) {
+    if ((turn.role === "user" || turn.role === "assistant") && !turn.text.trim()) return;
+    const key = memoryTurnKey(turn);
+    if (memoryTurnKeysRef.current.has(key)) return;
+    const textKey = memoryTextTurnKey(turn);
+    if (textKey && memoryTextKeysRef.current.has(textKey)) return;
+    memoryTurnKeysRef.current.add(key);
+    if (textKey) memoryTextKeysRef.current.add(textKey);
+    memorySessionTurnsRef.current = [...memorySessionTurnsRef.current, turn].slice(-MEMORY_SESSION_TURN_LIMIT);
+    setMemorySessionPreview([...memorySessionTurnsRef.current]);
+  }
+
+  function transcriptFromContent(content: NonNullable<RealtimeEvent["item"]>["content"] | undefined) {
+    if (!content?.length) return "";
+    return content
+      .map((part) => part.transcript ?? part.text ?? "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  function memoryTurnKey(turn: MemorySessionTurn) {
+    if (turn.role === "tool") return `tool:${turn.callId ?? ""}:${turn.name}:${stableStringify(turn.input)}`;
+    if (turn.role === "assistant") return `${turn.role}:${turn.itemId ?? ""}:${turn.responseId ?? ""}:${turn.text}`;
+    return `${turn.role}:${turn.itemId ?? ""}:${turn.text}`;
+  }
+
+  function memoryTextTurnKey(turn: MemorySessionTurn) {
+    if (turn.role === "tool") return "";
+    return `${turn.role}:${normalizeTranscriptText(turn.text)}`;
   }
 
   function appendLog(message: string) {
@@ -821,6 +981,65 @@ export function App() {
       setDoctorOutput(error instanceof Error ? error.message : String(error));
     } finally {
       setDoctorBusy(false);
+    }
+  }
+
+  async function ensureMemoryVault() {
+    if (!identity || !window.__TAURI_INTERNALS__) return;
+    try {
+      const result = await invoke<MemoryVaultStatus>("ensure_memory_vault", {
+        profile: identity.profileSlug,
+      });
+      setMemoryStatus(result);
+      setMemoryOutput(result.message);
+    } catch (error) {
+      setMemoryOutput(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function saveMemorySummary(turns: MemorySessionTurn[]) {
+    if (!identity || !window.__TAURI_INTERNALS__ || !turns.length || memoryBusy) return;
+    setMemoryBusy(true);
+    setMemoryOutput("Saving voice memory...");
+    try {
+      const result = await invoke<MemoryAppendResult>("summarize_and_append_memory", {
+        profile: identity.profileSlug,
+        assistantName: identity.assistantName,
+        personalityMode,
+        turns,
+      });
+      setMemoryOutput(result.written ? `${result.message}\n${result.path}` : result.message);
+      appendLog(result.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMemoryOutput(message);
+      appendLog(`Memory save failed: ${message}`);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function readMemoryContextForVoice() {
+    if (!identity || !window.__TAURI_INTERNALS__) return "";
+    try {
+      const result = await invoke<MemoryContextResult>("read_memory_context", {
+        profile: identity.profileSlug,
+      });
+      setMemoryStatus({
+        profile: result.profile,
+        path: result.path,
+        ready: true,
+        message: result.sourceCount
+          ? `Loaded ${result.sourceCount} memory sources${result.truncated ? " with cap" : ""}.`
+          : "Memory vault is ready.",
+      });
+      if (result.sourceCount) {
+        appendLog(`Loaded ${result.sourceCount} memory sources`);
+      }
+      return result.context;
+    } catch (error) {
+      appendLog(`Memory load failed: ${error instanceof Error ? error.message : String(error)}`);
+      return "";
     }
   }
 
@@ -1283,6 +1502,38 @@ export function App() {
                     </button>
                   </div>
                 </section>
+                <section className="provider-section session-debug-section" aria-label="Session transcript debug">
+                  <div>
+                    <span className="status-kicker">Session</span>
+                    <p>{memorySessionPreview.length ? `${memorySessionPreview.length} captured turns` : "No captured voice turns yet"}</p>
+                  </div>
+                  {memorySessionPreview.length ? (
+                    <div className="session-turn-list">
+                      {memorySessionPreview.slice(-5).map((turn, index) => (
+                        <div className="session-turn" key={`${turn.role}-${turn.at}-${index}`}>
+                          <span>{sessionTurnLabel(turn)}</span>
+                          <p>{sessionTurnPreview(turn)}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
+                <section className="provider-section" aria-label="Memory">
+                  <div>
+                    <span className="status-kicker">Memory</span>
+                    <p>{memoryStatus?.ready ? "Vault ready" : "Vault not checked yet"}</p>
+                  </div>
+                  {memoryStatus?.path ? (
+                    <div className="runtime-row memory-path-row">
+                      <span>Path</span>
+                      <strong>{memoryStatus.path}</strong>
+                    </div>
+                  ) : null}
+                  <button className="panel-action" type="button" onClick={ensureMemoryVault} disabled={memoryBusy}>
+                    {memoryBusy ? "Saving" : "Check Memory"}
+                  </button>
+                  {memoryOutput ? <pre className="panel-output provider-output">{memoryOutput}</pre> : null}
+                </section>
                 <button className="panel-action" type="button" onClick={runDoctor} disabled={doctorBusy}>
                   {doctorBusy ? "Running" : "Doctor"}
                 </button>
@@ -1397,6 +1648,33 @@ function parseFunctionArguments(raw: string | undefined) {
   } catch {
     return {};
   }
+}
+
+function stableStringify(value: unknown) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function sessionTurnLabel(turn: MemorySessionTurn) {
+  if (turn.role === "tool") return `Tool - ${turn.name}`;
+  return turn.role === "assistant" ? "Iris" : "You";
+}
+
+function sessionTurnPreview(turn: MemorySessionTurn) {
+  const text = turn.role === "tool" ? `${turn.name} ${stableStringify(turn.input)}` : turn.text;
+  return truncateText(text.replace(/\s+/g, " ").trim(), 180);
+}
+
+function truncateText(text: string, maxLength: number) {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function normalizeTranscriptText(text: string) {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function makeRuntimeRows(status: HermesRuntimeStatus) {
